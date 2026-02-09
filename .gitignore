@@ -1,0 +1,27 @@
+# Compiled objects
+*.o
+*.obj
+
+# Executables
+*.exe
+*.out
+fstcc
+fstcc_asm
+fstcc_c
+
+# Build output
+build/
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Generated assembly (from compiler output)
+*.generated.s

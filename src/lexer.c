@@ -1,75 +1,4 @@
-/* Minimal C Lexer
- * Tokenizes C source code into tokens
- */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <ctype.h>
-
-/* Token types */
-typedef enum {
-    TOKEN_EOF = 0,
-    TOKEN_IDENTIFIER,
-    TOKEN_NUMBER,
-    TOKEN_STRING,
-    TOKEN_CHAR,
-    
-    /* Keywords */
-    TOKEN_INT,
-    TOKEN_RETURN,
-    TOKEN_IF,
-    TOKEN_ELSE,
-    TOKEN_WHILE,
-    TOKEN_FOR,
-    TOKEN_MAIN,
-    
-    /* Operators */
-    TOKEN_PLUS,        /* + */
-    TOKEN_MINUS,       /* - */
-    TOKEN_MULTIPLY,    /* * */
-    TOKEN_DIVIDE,      /* / */
-    TOKEN_ASSIGN,      /* = */
-    TOKEN_EQUAL,       /* == */
-    TOKEN_NOT_EQUAL,   /* != */
-    TOKEN_LESS,        /* < */
-    TOKEN_GREATER,     /* > */
-    TOKEN_LESS_EQUAL,  /* <= */
-    TOKEN_GREATER_EQUAL, /* >= */
-    
-    /* Punctuation */
-    TOKEN_SEMICOLON,   /* ; */
-    TOKEN_COMMA,       /* , */
-    TOKEN_LPAREN,      /* ( */
-    TOKEN_RPAREN,      /* ) */
-    TOKEN_LBRACE,      /* { */
-    TOKEN_RBRACE,      /* } */
-    TOKEN_LBRACKET,    /* [ */
-    TOKEN_RBRACKET,    /* ] */
-    
-    /* Special */
-    TOKEN_UNKNOWN
-} TokenType;
-
-/* Token structure */
-typedef struct {
-    TokenType type;
-    char *text;
-    int length;
-    int value;          /* For numbers */
-    int line;
-    int column;
-} Token;
-
-/* Lexer state */
-typedef struct {
-    char *source;
-    int source_length;
-    int position;
-    int line;
-    int column;
-    Token current_token;
-} Lexer;
+#include "lexer.h"
 
 /* Global lexer instance */
 Lexer lexer;
@@ -85,7 +14,7 @@ void lexer_init(char *source) {
 }
 
 /* Get current character */
-char lexer_current() {
+char lexer_current(void) {
     if (lexer.position >= lexer.source_length) {
         return '\0';
     }
@@ -93,25 +22,25 @@ char lexer_current() {
 }
 
 /* Get next character */
-char lexer_next() {
+char lexer_next(void) {
     if (lexer.position >= lexer.source_length) {
         return '\0';
     }
-    
+
     char c = lexer.source[lexer.position++];
-    
+
     if (c == '\n') {
         lexer.line++;
         lexer.column = 1;
     } else {
         lexer.column++;
     }
-    
+
     return c;
 }
 
 /* Peek at next character without advancing */
-char lexer_peek() {
+char lexer_peek(void) {
     if (lexer.position >= lexer.source_length) {
         return '\0';
     }
@@ -119,32 +48,32 @@ char lexer_peek() {
 }
 
 /* Skip whitespace */
-void lexer_skip_whitespace() {
-    while (lexer_current() == ' ' || lexer_current() == '\t' || 
+void lexer_skip_whitespace(void) {
+    while (lexer_current() == ' ' || lexer_current() == '\t' ||
            lexer_current() == '\n' || lexer_current() == '\r') {
         lexer_next();
     }
 }
 
 /* Read identifier or keyword */
-Token lexer_read_identifier() {
+Token lexer_read_identifier(void) {
     int start = lexer.position;
-    
+
     while (isalnum(lexer_current()) || lexer_current() == '_') {
         lexer_next();
     }
-    
+
     int length = lexer.position - start;
     char *text = malloc(length + 1);
     strncpy(text, lexer.source + start, length);
     text[length] = '\0';
-    
+
     Token token;
     token.text = text;
     token.length = length;
     token.line = lexer.line;
     token.column = lexer.column - length;
-    
+
     /* Check for keywords */
     if (strcmp(text, "int") == 0) {
         token.type = TOKEN_INT;
@@ -163,25 +92,25 @@ Token lexer_read_identifier() {
     } else {
         token.type = TOKEN_IDENTIFIER;
     }
-    
+
     return token;
 }
 
 /* Read number */
-Token lexer_read_number() {
+Token lexer_read_number(void) {
     int start = lexer.position;
     int value = 0;
-    
+
     while (isdigit(lexer_current())) {
         value = value * 10 + (lexer_current() - '0');
         lexer_next();
     }
-    
+
     int length = lexer.position - start;
     char *text = malloc(length + 1);
     strncpy(text, lexer.source + start, length);
     text[length] = '\0';
-    
+
     Token token;
     token.type = TOKEN_NUMBER;
     token.text = text;
@@ -189,42 +118,42 @@ Token lexer_read_number() {
     token.value = value;
     token.line = lexer.line;
     token.column = lexer.column - length;
-    
+
     return token;
 }
 
 /* Read string literal */
-Token lexer_read_string() {
+Token lexer_read_string(void) {
     lexer_next(); /* Skip opening quote */
     int start = lexer.position;
-    
+
     while (lexer_current() != '"' && lexer_current() != '\0') {
         lexer_next();
     }
-    
+
     int length = lexer.position - start;
     char *text = malloc(length + 1);
     strncpy(text, lexer.source + start, length);
     text[length] = '\0';
-    
+
     if (lexer_current() == '"') {
         lexer_next(); /* Skip closing quote */
     }
-    
+
     Token token;
     token.type = TOKEN_STRING;
     token.text = text;
     token.length = length;
     token.line = lexer.line;
     token.column = lexer.column - length - 1;
-    
+
     return token;
 }
 
 /* Get next token */
-Token lexer_next_token() {
+Token lexer_next_token(void) {
     lexer_skip_whitespace();
-    
+
     if (lexer_current() == '\0') {
         Token token;
         token.type = TOKEN_EOF;
@@ -234,39 +163,39 @@ Token lexer_next_token() {
         token.column = lexer.column;
         return token;
     }
-    
+
     char c = lexer_current();
-    
+
     /* Identifiers and keywords */
     if (isalpha(c) || c == '_') {
         return lexer_read_identifier();
     }
-    
+
     /* Numbers */
     if (isdigit(c)) {
         return lexer_read_number();
     }
-    
+
     /* String literals */
     if (c == '"') {
         return lexer_read_string();
     }
-    
+
     /* Single character tokens */
     Token token;
     token.line = lexer.line;
     token.column = lexer.column;
-    token.text = malloc(2);
+    token.text = malloc(3);
     token.text[0] = c;
     token.text[1] = '\0';
     token.length = 1;
-    
+
     switch (c) {
         case '+': token.type = TOKEN_PLUS; break;
         case '-': token.type = TOKEN_MINUS; break;
         case '*': token.type = TOKEN_MULTIPLY; break;
         case '/': token.type = TOKEN_DIVIDE; break;
-        case '=': 
+        case '=':
             lexer_next();
             if (lexer_current() == '=') {
                 lexer_next();
@@ -322,22 +251,22 @@ Token lexer_next_token() {
         case '}': token.type = TOKEN_RBRACE; break;
         case '[': token.type = TOKEN_LBRACKET; break;
         case ']': token.type = TOKEN_RBRACKET; break;
-        default: 
+        default:
             token.type = TOKEN_UNKNOWN;
             lexer_next();
             return token;
     }
-    
-    if (token.type != TOKEN_EQUAL && token.type != TOKEN_NOT_EQUAL && 
+
+    if (token.type != TOKEN_EQUAL && token.type != TOKEN_NOT_EQUAL &&
         token.type != TOKEN_LESS_EQUAL && token.type != TOKEN_GREATER_EQUAL) {
         lexer_next();
     }
-    
+
     return token;
 }
 
 /* Get token type name for debugging */
-const char* token_type_name(TokenType type) {
+const char *token_type_name(TokenType type) {
     switch (type) {
         case TOKEN_EOF: return "EOF";
         case TOKEN_IDENTIFIER: return "IDENTIFIER";
@@ -373,33 +302,4 @@ const char* token_type_name(TokenType type) {
         case TOKEN_UNKNOWN: return "UNKNOWN";
         default: return "UNKNOWN";
     }
-}
-
-/* Test the lexer */
-int main() {
-    char *test_code = "int main() {\n    int x = 42;\n    return x + 1;\n}";
-    
-    printf("Testing lexer with code:\n%s\n\n", test_code);
-    
-    lexer_init(test_code);
-    
-    Token token;
-    do {
-        token = lexer_next_token();
-        printf("Token: %-15s Text: %-10s Line: %d, Column: %d", 
-               token_type_name(token.type), 
-               token.text ? token.text : "NULL",
-               token.line, token.column);
-        
-        if (token.type == TOKEN_NUMBER) {
-            printf(" Value: %d", token.value);
-        }
-        printf("\n");
-        
-        if (token.text) {
-            free(token.text);
-        }
-    } while (token.type != TOKEN_EOF);
-    
-    return 0;
 }
