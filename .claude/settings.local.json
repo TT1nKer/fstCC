@@ -2,7 +2,14 @@
   "permissions": {
     "allow": [
       "Bash(make:*)",
-      "Bash(./build/fstcc.exe --test:*)"
+      "Bash(./build/fstcc.exe --test:*)",
+      "Bash(\"d:/fstCC/build/fstcc.exe\" --test)",
+      "Bash(\"d:/fstCC/build/fstcc.exe\":*)",
+      "Bash(\"d:/fstCC/build/fstcc.exe\" \"d:/fstCC/tests/stage0/while_loop.c\" \"d:/fstCC/build/test_while_loop.s\")",
+      "Bash(\"d:/fstCC/build/fstcc.exe\" \"d:/fstCC/tests/stage0/functions.c\" \"d:/fstCC/build/test_functions.s\")",
+      "Bash(\"d:/fstCC/build/fstcc.exe\" \"d:/fstCC/tests/stage0/fibonacci.c\" \"d:/fstCC/build/test_fibonacci.s\")",
+      "Bash(echo:*)",
+      "Bash(git checkout:*)"
     ]
   }
 }
