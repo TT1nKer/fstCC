@@ -1,0 +1,18 @@
+func             input                                  output
+-----------------------------------------------------------------------
+_start           argc/argv                               exit code
+compile_file     (g_in_ptr,g_in_size,g_out_fd)           none
+
+lexer_init       in_ptr,in_size                          g_cur,g_end,g_has_tok=0
+next_token       cursor, tok_ptr                         new_cursor, tok(kind/val/start/len)
+peek             (g_cur,g_has_tok,g_tok)                 kind
+consume          kind                                    0/1, and advance cursor
+expect           kind                                    (die on mismatch)
+
+parse_program    peek/consume/expect                     Program*
+parse_function   peek/consume/expect                     Func*
+parse_stmt       peek/consume/expect                     Node*
+parse_expr       peek/consume/expect                     Node*
+
+gen_program      Program*, out_fd                        bytes emitted
+emit_flush       out_fd                                  none
