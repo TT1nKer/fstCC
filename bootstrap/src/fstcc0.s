@@ -158,6 +158,13 @@ expected_token_msg:
     .asciz "unexpected token"
 expected_token_msg_len = . - expected_token_msg
 
+undeclared_var_msg:
+    .asciz "undeclared variable"
+undeclared_var_msg_len = . - undeclared_var_msg
+
+str_main:
+    .ascii "main"              # NOT null-terminated (we use length=4)
+
 #====================== macros ======================
 .macro EXIT code
     li a0, \code
@@ -253,7 +260,7 @@ _start:
     # openat(AT_FDCWD, pathname, O_WRONLY|O_CREAT|O_TRUNC, 0644)
     li      a0, AT_FDCWD
     li      a2, (O_WRONLY | O_CREAT | O_TRUNC)
-    li      a3, 0644                  # mode rw-r--r--
+    li      a3, 420                   # mode 0644 octal = rw-r--r--
     li      a7, 56
     ecall
     bltz    a0, .open_out_error
@@ -279,11 +286,76 @@ _start:
     la      t1, g_out_buf
     sd      t1, 0(t0)
 
+    # -------- init reloc state --------
+    la      t0, g_reloc_count
+    sd      x0, 0(t0)
+    la      t0, g_func_count
+    sd      x0, 0(t0)
+
+    # -------- emit _start stub --------
+    # The generated binary's _start will:
+    #   jal ra, main   (patched by fixup_calls via a reloc entry)
+    #   mv a0, a0      (result already in a0)
+    #   li a7, 93      (SYS_exit)
+    #   ecall
+
+    # Record _start's jal as a relocation to "main"
+    la      t0, g_emit_ptr
+    ld      s4, 0(t0)          # s4 = addr of jal instruction (callee-saved)
+
+    # emit: jal ra, 0  (placeholder, will be patched to jump to main)
+    li      a0, 0x000000EF     # jal ra, 0
+    call    emit_u32
+
+    # record reloc for "main"
+    la      t0, g_reloc_count
+    ld      t2, 0(t0)
+    li      t3, 24
+    mul     t3, t2, t3
+    la      t4, g_reloc_table
+    add     t4, t4, t3
+    sd      s4, 0(t4)          # call site addr (saved in s4)
+
+    # We need a pointer to the string "main" in our rodata
+    la      t5, str_main
+    sd      t5, 8(t4)          # func_name_ptr
+    li      t5, 4
+    sd      t5, 16(t4)         # func_name_len = 4
+    addi    t2, t2, 1
+    sd      t2, 0(t0)
+
+    # emit: li a7, 93  = addi a7, x0, 93
+    # I-type: imm=93=0x5D, rs1=x0, funct3=000, rd=a7=x17, op=0010011
+    # 0x05D00893
+    li      a0, 0x05D00893
+    call    emit_u32
+
+    # emit: ecall = 0x00000073
+    li      a0, 0x00000073
+    call    emit_u32
+
+    # -------- parse all function definitions --------
     call    parse_program
 
-#---------------------- codegen ---------------------
-    # TODO: write [g_out_buf .. g_emit_ptr) to g_out_fd via SYS_write
-    # TODO(TOUNDERSTAND): buffering strategy vs direct writes
+#---------------------- write output ---------------------
+    # write [g_out_buf .. g_emit_ptr) to g_out_fd via SYS_write
+    la      t0, g_out_buf
+    la      t1, g_emit_ptr
+    ld      t1, 0(t1)
+    sub     t2, t1, t0          # t2 = byte count
+
+    la      t3, g_out_fd
+    ld      a0, 0(t3)          # fd
+    mv      a1, t0             # buf
+    mv      a2, t2             # count
+    li      a7, 64             # SYS_write
+    ecall
+
+    # close output fd
+    la      t0, g_out_fd
+    ld      a0, 0(t0)
+    li      a7, 57             # SYS_close
+    ecall
 
     EXIT 0
 
@@ -925,6 +997,422 @@ patch_u32:
     sw   a1, 0(a0)
     ret
 
+#-------------------------------- emit_li_a0 --------------------------------
+# a0 = immediate value to load into a0 in the *generated* code.
+# If value fits in signed 12 bits [-2048, 2047]: emit addi a0, x0, val
+# Otherwise: emit lui a0, upper20 ; addi a0, a0, lower12
+.globl emit_li_a0
+emit_li_a0:
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+    sd   s1, 0(sp)
+    mv   s1, a0              # s1 = value
+
+    # check if fits in signed 12 bits
+    li   t0, -2048
+    blt  s1, t0, .li_large
+    li   t0, 2047
+    bgt  s1, t0, .li_large
+
+    # small: addi a0, x0, val
+    # I-type: imm[11:0] at bits [31:20]
+    # Extract low 12 bits via shift pair (avoids andi with 0xFFF)
+    slli t1, s1, 52
+    srli t1, t1, 32           # low 12 bits of s1 now in bits [31:20]
+    li   t2, 0x00000513       # addi a0, x0, 0
+    or   a0, t1, t2
+    call emit_u32
+    j    .li_done
+
+.li_large:
+    # lui a0, upper20 ; addi a0, a0, lower12
+    # Extract low 12 bits
+    slli t1, s1, 52
+    srli t1, t1, 52           # t1 = zero-extended low 12 bits
+    # upper = value >> 12 (arithmetic)
+    srai t2, s1, 12
+
+    # if bit 11 of lower is set, addi will sign-extend and subtract from upper
+    # so we compensate: upper += 1
+    srli t3, t1, 11           # bit 11 → bit 0
+    andi t3, t3, 1
+    add  t2, t2, t3           # upper += (bit11 ? 1 : 0)
+
+    # lui a0, upper20
+    # U-type: imm at bits [31:12]
+    slli t2, t2, 12           # shift upper to bits [31:12]
+    li   t3, 0x00000537       # lui a0, 0
+    or   a0, t2, t3
+    call emit_u32
+
+    # addi a0, a0, lower12
+    slli t1, t1, 20           # low 12 bits → bits [31:20]
+    li   t2, 0x00050513       # addi a0, a0, 0
+    or   a0, t1, t2
+    call emit_u32
+
+.li_done:
+    ld   s1, 0(sp)
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
+
+#-------------------------------- emit_ld_a0_off_s0 --------------------------------
+# a0 = signed offset (e.g. -24)
+# Emits: ld a0, offset(s0)
+# I-type: imm[11:0] at bits [31:20]
+.globl emit_ld_a0_off_s0
+emit_ld_a0_off_s0:
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+
+    slli t1, a0, 52
+    srli t1, t1, 32           # low 12 bits → bits [31:20]
+    li   t2, 0x00043503       # ld a0, 0(s0)
+    or   a0, t1, t2
+    call emit_u32
+
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
+
+#-------------------------------- emit_sd_a0_off_s0 --------------------------------
+# a0 = signed offset (e.g. -24)
+# Emits: sd a0, offset(s0)
+# S-type: imm[11:5] at bits [31:25], imm[4:0] at bits [11:7]
+.globl emit_sd_a0_off_s0
+emit_sd_a0_off_s0:
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+
+    # extract low 12 bits of offset
+    slli t0, a0, 52
+    srli t0, t0, 52           # t0 = zero-extended 12-bit offset
+
+    # imm[4:0] → instruction bits [11:7]
+    andi t1, t0, 0x1F         # 0x1F fits in 12-bit signed
+    slli t1, t1, 7
+
+    # imm[11:5] → instruction bits [31:25]
+    srli t2, t0, 5            # shift bits [11:5] down to [6:0]
+    andi t2, t2, 0x7F         # keep 7 bits (0x7F fits in 12-bit signed)
+    slli t2, t2, 25           # shift to bits [31:25]
+
+    or   t1, t1, t2
+    li   t3, 0x00A43023       # sd a0, 0(s0) base (rs2=a0, rs1=s0)
+    or   a0, t1, t3
+    call emit_u32
+
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
+
+#-------------------------------- emit_sd_aX_off_s0 --------------------------------
+# a0 = register index X (0-7 for a0-a7, i.e. x10-x17)
+# a1 = signed offset
+# Emits: sd aX, offset(s0)
+.globl emit_sd_aX_off_s0
+emit_sd_aX_off_s0:
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+
+    # rs2 field = x(10+a0), goes into bits [24:20]
+    addi t4, a0, 10
+    slli t4, t4, 20
+
+    # extract low 12 bits of offset
+    slli t0, a1, 52
+    srli t0, t0, 52
+
+    # imm[4:0] → bits [11:7]
+    andi t1, t0, 0x1F
+    slli t1, t1, 7
+
+    # imm[11:5] → bits [31:25]
+    srli t2, t0, 5
+    andi t2, t2, 0x7F
+    slli t2, t2, 25
+
+    or   t1, t1, t2
+    or   t1, t1, t4           # add rs2
+
+    # base: sd x0, 0(s0) (rs2 cleared, we provide it above)
+    li   t3, 0x00043023
+    or   a0, t1, t3
+    call emit_u32
+
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
+
+#-------------------------------- emit_push_a0 --------------------------------
+# Emits: addi sp, sp, -8 ; sd a0, 0(sp)
+# Used to push left operand in binary expressions.
+.globl emit_push_a0
+emit_push_a0:
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+
+    li   a0, 0xFF810113       # addi sp, sp, -8
+    call emit_u32
+    li   a0, 0x00A13023       # sd a0, 0(sp)
+    call emit_u32
+
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
+
+#-------------------------------- emit_pop_a1 --------------------------------
+# Emits: ld a1, 0(sp) ; addi sp, sp, 8
+# Used to pop left operand into a1 after right operand is computed in a0.
+.globl emit_pop_a1
+emit_pop_a1:
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+
+    li   a0, 0x00013583       # ld a1, 0(sp)
+    call emit_u32
+    li   a0, 0x00810113       # addi sp, sp, 8
+    call emit_u32
+
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
+
+#-------------------------------- emit_beqz_a0_hole --------------------------------
+# Emits: beqz a0, 0  (B-type placeholder with offset=0)
+# Returns a0 = address of the emitted word in g_out_buf (for patching).
+.globl emit_beqz_a0_hole
+emit_beqz_a0_hole:
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+
+    la   t0, g_emit_ptr
+    ld   s1, 0(t0)            # save current emit address (use s1 temporarily - but we need to save it)
+
+    # Actually, let's save it properly
+    sd   s1, 0(sp)
+    la   t0, g_emit_ptr
+    ld   s1, 0(t0)            # s1 = address of hole
+
+    # beq a0, x0, 0  →  B-type: imm=0, rs1=a0(x10), rs2=x0, funct3=000
+    # opcode=1100011, funct3=000, rs1=01010, rs2=00000, imm=0
+    li   a0, 0x00050063       # beq a0, x0, 0
+    call emit_u32
+
+    mv   a0, s1               # return hole address
+    ld   s1, 0(sp)
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
+
+#-------------------------------- emit_j_hole --------------------------------
+# Emits: jal x0, 0 (J-type placeholder with offset=0)
+# Returns a0 = address of the emitted word in g_out_buf (for patching).
+.globl emit_j_hole
+emit_j_hole:
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+    sd   s1, 0(sp)
+
+    la   t0, g_emit_ptr
+    ld   s1, 0(t0)            # s1 = address of hole
+
+    # jal x0, 0 → J-type: imm=0, rd=x0
+    # opcode=1101111, rd=00000, imm=0
+    li   a0, 0x0000006F       # jal x0, 0
+    call emit_u32
+
+    mv   a0, s1
+    ld   s1, 0(sp)
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
+
+#-------------------------------- patch_branch --------------------------------
+# a0 = address of B-type instruction in g_out_buf
+# a1 = target address in g_out_buf
+# Computes offset = target - hole_addr, encodes B-type imm, patches.
+# B-type imm layout (13-bit signed, bit 0 always 0):
+#   offset bit 12   → instr bit 31
+#   offset bits 10:5 → instr bits 30:25
+#   offset bits 4:1  → instr bits 11:8
+#   offset bit 11   → instr bit 7
+.globl patch_branch
+patch_branch:
+    sub  t0, a1, a0           # t0 = offset (signed, in bytes)
+
+    # bit 12 → instr bit 31
+    srli t1, t0, 12
+    andi t1, t1, 1            # isolate bit 12 (now in bit 0)
+    slli t1, t1, 31           # → bit 31
+
+    # bits 10:5 → instr bits 30:25
+    srli t2, t0, 5
+    andi t2, t2, 0x3F         # 6 bits (0x3F fits in 12-bit signed)
+    slli t2, t2, 25           # → bits 30:25
+
+    # bits 4:1 → instr bits 11:8
+    srli t3, t0, 1
+    andi t3, t3, 0xF          # 4 bits
+    slli t3, t3, 8            # → bits 11:8
+
+    # bit 11 → instr bit 7
+    srli t4, t0, 11
+    andi t4, t4, 1
+    slli t4, t4, 7            # → bit 7
+
+    or   t1, t1, t2
+    or   t1, t1, t3
+    or   t1, t1, t4           # combined imm fields
+
+    # load existing instruction, clear imm fields, OR in new imm
+    # keep: opcode[6:0], funct3[14:12], rs1[19:15], rs2[24:20]
+    # mask = 0x01FFF07F
+    lw   t5, 0(a0)
+    li   t6, 0x01FFF07F
+    and  t5, t5, t6
+    or   t5, t5, t1
+    sw   t5, 0(a0)
+    ret
+
+#-------------------------------- patch_jump --------------------------------
+# a0 = address of J-type instruction in g_out_buf
+# a1 = target address in g_out_buf
+# Computes offset = target - hole_addr, encodes J-type imm, patches.
+# J-type imm layout (21-bit signed, bit 0 always 0):
+#   offset bit 20   → instr bit 31
+#   offset bits 10:1 → instr bits 30:21
+#   offset bit 11   → instr bit 20
+#   offset bits 19:12 → instr bits 19:12
+.globl patch_jump
+patch_jump:
+    sub  t0, a1, a0           # t0 = offset (signed)
+
+    # bit 20 → instr bit 31
+    srli t1, t0, 20
+    andi t1, t1, 1
+    slli t1, t1, 31
+
+    # bits 10:1 → instr bits 30:21
+    srli t2, t0, 1
+    li   t6, 0x3FF            # 10 bits mask (fits in 12-bit signed)
+    and  t2, t2, t6
+    slli t2, t2, 21
+
+    # bit 11 → instr bit 20
+    srli t3, t0, 11
+    andi t3, t3, 1
+    slli t3, t3, 20
+
+    # bits 19:12 → instr bits 19:12 (same position)
+    srli t4, t0, 12
+    andi t4, t4, 0xFF         # 8 bits
+    slli t4, t4, 12
+
+    or   t1, t1, t2
+    or   t1, t1, t3
+    or   t1, t1, t4           # combined imm
+
+    # keep opcode + rd (bits 11:0): zero out bits [31:12]
+    lwu  t5, 0(a0)            # lwu: zero-extend 32-bit load
+    slli t5, t5, 52           # clear bits above 11
+    srli t5, t5, 52           # t5 = bits [11:0] only
+    or   t5, t5, t1
+    sw   t5, 0(a0)
+    ret
+
+#-------------------------------- emit_epilogue --------------------------------
+# Emits the 4-instruction epilogue sequence for the *generated* function.
+.globl emit_epilogue
+emit_epilogue:
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+
+    li   a0, EMIT_MV_SP_S0
+    call emit_u32
+    li   a0, EMIT_LD_RA_M8_S0
+    call emit_u32
+    li   a0, EMIT_LD_S0_M16_S0
+    call emit_u32
+    li   a0, EMIT_RET
+    call emit_u32
+
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
+
+#-------------------------------- sym_lookup --------------------------------
+# a0 = name_ptr (into mmap), a1 = name_len
+# Scans g_sym_table for matching entry.
+# Returns: a0 = fp_offset if found, a1 = 1
+#          a0 = 0, a1 = 0 if not found
+.globl sym_lookup
+sym_lookup:
+    # a0 = name_ptr, a1 = name_len
+    # Uses: t0-t6, a2 (as temp — caller-saved, fine for a leaf-ish function)
+    # Returns: a0 = fp_offset, a1 = 1 if found; a0=0, a1=0 if not
+    la   t0, g_sym_count
+    ld   t1, 0(t0)            # t1 = count
+    la   t2, g_sym_table      # t2 = table cursor
+    li   t3, 0                # t3 = index
+.sym_loop:
+    bge  t3, t1, .sym_notfound
+
+    ld   t4, 8(t2)            # entry.name_len
+    bne  t4, a1, .sym_next    # lengths differ → skip
+
+    # lengths match: compare bytes
+    ld   t4, 0(t2)            # t4 = entry.name_ptr
+    mv   t5, a0               # t5 = needle ptr (copy, will advance)
+    mv   t6, a1               # t6 = remaining count
+.sym_cmp:
+    beqz t6, .sym_found
+    lbu  a2, 0(t4)            # byte from entry
+    lbu  a3, 0(t5)            # byte from needle (a3 is caller-saved)
+    bne  a2, a3, .sym_next
+    addi t4, t4, 1
+    addi t5, t5, 1
+    addi t6, t6, -1
+    j    .sym_cmp
+
+.sym_found:
+    ld   a0, 16(t2)           # fp_offset
+    li   a1, 1
+    ret
+
+.sym_next:
+    addi t2, t2, 24
+    addi t3, t3, 1
+    j    .sym_loop
+
+.sym_notfound:
+    li   a0, 0
+    li   a1, 0
+    ret
+
+#-------------------------------- sym_add --------------------------------
+# a0 = name_ptr, a1 = name_len, a2 = fp_offset
+# Adds entry to g_sym_table[g_sym_count], increments g_sym_count.
+.globl sym_add
+sym_add:
+    la   t0, g_sym_count
+    ld   t1, 0(t0)            # t1 = current count
+
+    # address = g_sym_table + count * 24
+    li   t2, 24
+    mul  t2, t1, t2
+    la   t3, g_sym_table
+    add  t3, t3, t2           # t3 = &table[count]
+
+    sd   a0, 0(t3)            # name_ptr
+    sd   a1, 8(t3)            # name_len
+    sd   a2, 16(t3)           # fp_offset
+
+    addi t1, t1, 1
+    sd   t1, 0(t0)            # g_sym_count++
+    ret
+
 
 #==============================================================================
 # Parser  (recursive descent, single-pass codegen into g_out_buf)
@@ -951,8 +1439,108 @@ parse_program:
     j    .pp_loop
 
 .pp_done:
+    # --- fixup pass: resolve all call relocations ---
+    call fixup_calls
+
     ld   ra, 8(sp)
     addi sp, sp, 16
+    ret
+
+#-------------------------------- fixup_calls --------------------------------
+# Iterates g_reloc_table. For each entry, finds the function in g_func_table
+# and patches the jal instruction at the call site.
+.globl fixup_calls
+fixup_calls:
+    addi sp, sp, -32
+    sd   ra, 24(sp)
+    sd   s1, 16(sp)
+    sd   s2,  8(sp)
+    sd   s3,  0(sp)
+
+    la   t0, g_reloc_count
+    ld   s1, 0(t0)           # s1 = reloc count
+    la   s2, g_reloc_table   # s2 = reloc cursor
+    li   s3, 0               # s3 = index
+
+.fix_loop:
+    bge  s3, s1, .fix_done
+    ld   t0, 0(s2)           # call_site_addr
+    ld   t1, 8(s2)           # func_name_ptr
+    ld   t2, 16(s2)          # func_name_len
+
+    # save call_site on stack (t-regs clobbered by lookup)
+    addi sp, sp, -8
+    sd   t0, 0(sp)
+
+    # look up function in g_func_table
+    mv   a0, t1
+    mv   a1, t2
+    call func_lookup          # a0 = func_addr, a1 = found?
+
+    ld   t0, 0(sp)           # restore call_site_addr
+    addi sp, sp, 8
+
+    beqz a1, .fix_next       # not found = skip (error in real compiler)
+
+    # patch jal: offset = func_addr - call_site_addr
+    mv   a1, a0              # a1 = target (func_addr)
+    mv   a0, t0              # a0 = call_site_addr
+    call patch_jump
+
+.fix_next:
+    addi s2, s2, 24
+    addi s3, s3, 1
+    j    .fix_loop
+
+.fix_done:
+    ld   s3,  0(sp)
+    ld   s2,  8(sp)
+    ld   s1, 16(sp)
+    ld   ra, 24(sp)
+    addi sp, sp, 32
+    ret
+
+#-------------------------------- func_lookup --------------------------------
+# a0 = name_ptr, a1 = name_len
+# Returns: a0 = func output addr, a1 = 1 if found; a0=0, a1=0 if not found.
+.globl func_lookup
+func_lookup:
+    la   t0, g_func_count
+    ld   t1, 0(t0)
+    la   t2, g_func_table
+    li   t3, 0
+.fl_loop:
+    bge  t3, t1, .fl_notfound
+    ld   t4, 8(t2)           # entry.name_len
+    bne  t4, a1, .fl_next
+
+    # lengths match: compare bytes
+    ld   t4, 0(t2)           # t4 = entry.name_ptr
+    mv   t5, a0              # t5 = needle ptr
+    mv   t6, a1              # t6 = remaining count
+.fl_cmp:
+    beqz t6, .fl_found
+    lbu  a2, 0(t4)
+    lbu  a3, 0(t5)
+    bne  a2, a3, .fl_next
+    addi t4, t4, 1
+    addi t5, t5, 1
+    addi t6, t6, -1
+    j    .fl_cmp
+
+.fl_found:
+    ld   a0, 16(t2)          # func output addr
+    li   a1, 1
+    ret
+
+.fl_next:
+    addi t2, t2, 24
+    addi t3, t3, 1
+    j    .fl_loop
+
+.fl_notfound:
+    li   a0, 0
+    li   a1, 0
     ret
 
 #-------------------------------- parse_funcdef --------------------------------
@@ -1003,15 +1591,23 @@ parse_funcdef:
     la   t0, g_sym_count
     sd   x0, 0(t0)          # clear symbol table
 
-    # --- parse parameter list ---
-    # parse_params: for each 'int ident', increments g_frame_size by 8,
-    # adds entry to g_sym_table, emits sd aX, -offset(s0).
-    call parse_params
+    # --- record function address in g_func_table ---
+    la   t0, g_emit_ptr
+    ld   t1, 0(t0)          # t1 = function start address in g_out_buf
+    la   t0, g_func_count
+    ld   t2, 0(t0)
+    li   t3, 24
+    mul  t3, t2, t3
+    la   t4, g_func_table
+    add  t4, t4, t3
+    sd   s1, 0(t4)          # func_name_ptr
+    sd   s2, 8(t4)          # func_name_len
+    sd   t1, 16(t4)         # func output addr
+    addi t2, t2, 1
+    sd   t2, 0(t0)
 
-    li   a0, TK_RPAREN
-    call expect
-
-    # --- emit prologue words [0..2] ---
+    # --- emit prologue words [0..2] BEFORE parse_params ---
+    # (params emit sd aX,offset(s0) which requires s0 to be set)
     li   a0, EMIT_SD_RA_M8_SP
     call emit_u32
     li   a0, EMIT_SD_S0_M16_SP
@@ -1025,18 +1621,31 @@ parse_funcdef:
     li   a0, EMIT_ADDI_SP_SP_0
     call emit_u32           # placeholder: addi sp, sp, 0
 
+    # --- parse parameter list ---
+    # parse_params: for each 'int ident', increments g_frame_size by 8,
+    # adds entry to g_sym_table, emits sd aX, -offset(s0).
+    call parse_params
+
+    li   a0, TK_RPAREN
+    call expect
+
     # --- parse function body ---
     # parse_block emits statements; parse_stmt emits the epilogue at 'return'.
     call parse_block
 
     # --- backpatch frame HOLE with actual frame size ---
-    # Target instruction: addi sp, sp, -frame_size
-    # I-type encoding: (sign12(-N) << 20) | EMIT_ADDI_SP_SP_0
+    # Align frame_size up to multiple of 16 (RISC-V ABI)
     la   t0, g_frame_size
-    ld   t1, 0(t0)          # t1 = frame_size  (positive, e.g. 32)
-    neg  t1, t1             # t1 = -frame_size
-    andi t1, t1, 0xFFF      # keep 12 bits (two's complement)
-    slli t1, t1, 20         # shift into imm[31:20]
+    ld   t1, 0(t0)          # t1 = frame_size  (positive, e.g. 24)
+    addi t1, t1, 15         # round up
+    andi t1, t1, -16        # align to 16 (-16 = 0xFFFF...FFF0, andi sign-extends -16 OK)
+    sd   t1, 0(t0)          # store aligned size
+
+    # Target instruction: addi sp, sp, -frame_size
+    # I-type encoding: extract low 12 bits of -frame_size, place at bits [31:20]
+    neg  t1, t1             # t1 = -frame_size (negative)
+    slli t1, t1, 52         # clear upper bits, keep low 12
+    srli t1, t1, 32         # move 12-bit imm to bits [31:20]
     li   t2, EMIT_ADDI_SP_SP_0
     or   t1, t1, t2         # combine with base instruction
 
@@ -1065,7 +1674,67 @@ parse_funcdef:
 #   - if peek == TK_COMMA: consume and loop; else done
 .globl parse_params
 parse_params:
-    ret                     # TODO
+    addi sp, sp, -32
+    sd   ra, 24(sp)
+    sd   s1, 16(sp)         # s1 = param_index
+    sd   s2,  8(sp)         # s2 = name_ptr
+    sd   s3,  0(sp)         # s3 = name_len
+    li   s1, 0              # param_index = 0
+
+.pp_param_loop:
+    call peek
+    li   t0, TK_RPAREN
+    beq  a0, t0, .pp_params_done   # no more params
+
+    # expect 'int'
+    li   a0, TK_INT
+    call expect
+
+    # capture ident name (peek fills g_tok, then expect consumes)
+    call peek
+    la   t0, g_tok
+    ld   s2, 16(t0)         # name_ptr = tok.start
+    ld   s3, 24(t0)         # name_len = tok.len
+    li   a0, TK_IDENT
+    call expect
+
+    # bump g_frame_size by 8, get offset = -new_frame_size
+    la   t0, g_frame_size
+    ld   t1, 0(t0)
+    addi t1, t1, 8
+    sd   t1, 0(t0)
+    neg  t2, t1             # t2 = -frame_size = offset
+
+    # sym_add(name_ptr, name_len, offset)
+    mv   a0, s2
+    mv   a1, s3
+    mv   a2, t2
+    call sym_add
+
+    # emit: sd aX, offset(s0)
+    # reload offset (t2 was clobbered by sym_add)
+    la   t0, g_frame_size
+    ld   t1, 0(t0)
+    neg  t2, t1
+    mv   a0, s1             # param_index (0=a0, 1=a1, ...)
+    mv   a1, t2             # offset
+    call emit_sd_aX_off_s0
+
+    addi s1, s1, 1          # param_index++
+
+    # if next is comma, consume and continue; else done
+    li   a0, TK_COMMA
+    call consume
+    bnez a0, .pp_param_loop  # consumed comma -> next param
+    j    .pp_params_done     # no comma -> done
+
+.pp_params_done:
+    ld   s3,  0(sp)
+    ld   s2,  8(sp)
+    ld   s1, 16(sp)
+    ld   ra, 24(sp)
+    addi sp, sp, 32
+    ret
 
 #-------------------------------- parse_block --------------------------------
 # Parses: '{' stmt* '}'
@@ -1077,7 +1746,15 @@ parse_block:
     li   a0, TK_LBRACE
     call expect
 
-    # TODO: loop calling parse_stmt until peek() == TK_RBRACE
+.pb_loop:
+    call peek
+    li   t0, TK_RBRACE
+    beq  a0, t0, .pb_done
+    li   t0, TK_EOF
+    beq  a0, t0, .pb_done     # safety: don't loop forever on missing '}'
+    call parse_stmt
+    j    .pb_loop
+.pb_done:
 
     li   a0, TK_RBRACE
     call expect
@@ -1098,7 +1775,186 @@ parse_block:
 #   EMIT_MV_SP_S0 / EMIT_LD_RA_M8_S0 / EMIT_LD_S0_M16_S0 / EMIT_RET
 .globl parse_stmt
 parse_stmt:
-    ret                     # TODO
+    addi sp, sp, -32
+    sd   ra, 24(sp)
+    sd   s1, 16(sp)         # s1 = scratch (hole addr, etc.)
+    sd   s2,  8(sp)         # s2 = scratch
+    sd   s3,  0(sp)         # s3 = scratch
+
+    call peek
+
+    li   t0, TK_RETURN
+    beq  a0, t0, .ps_return
+    li   t0, TK_IF
+    beq  a0, t0, .ps_if
+    li   t0, TK_WHILE
+    beq  a0, t0, .ps_while
+    li   t0, TK_LBRACE
+    beq  a0, t0, .ps_block
+    li   t0, TK_INT
+    beq  a0, t0, .ps_vardecl
+    j    .ps_exprstmt
+
+# ---- return expr ; ----
+.ps_return:
+    li   a0, TK_RETURN
+    call consume
+
+    call parse_expr
+    call emit_epilogue
+
+    li   a0, TK_SEMI
+    call expect
+    j    .ps_done
+
+# ---- if ( expr ) stmt [else stmt] ----
+.ps_if:
+    li   a0, TK_IF
+    call consume
+
+    li   a0, TK_LPAREN
+    call expect
+    call parse_expr
+    li   a0, TK_RPAREN
+    call expect
+
+    # emit beqz a0, ? (hole for else/endif)
+    call emit_beqz_a0_hole
+    mv   s1, a0             # s1 = beqz hole addr
+
+    call parse_stmt          # then-branch
+
+    # check for 'else'
+    call peek
+    li   t0, TK_ELSE
+    bne  a0, t0, .ps_if_no_else
+
+    # has else: emit j ? (hole for endif), patch beqz to here
+    li   a0, TK_ELSE
+    call consume
+
+    call emit_j_hole
+    mv   s2, a0             # s2 = j hole addr (skip else)
+
+    # patch beqz to current emit position (start of else body)
+    mv   a0, s1
+    la   t0, g_emit_ptr
+    ld   a1, 0(t0)
+    call patch_branch
+
+    call parse_stmt          # else-branch
+
+    # patch j to current emit position (end of else)
+    mv   a0, s2
+    la   t0, g_emit_ptr
+    ld   a1, 0(t0)
+    call patch_jump
+    j    .ps_done
+
+.ps_if_no_else:
+    # patch beqz to current emit position
+    mv   a0, s1
+    la   t0, g_emit_ptr
+    ld   a1, 0(t0)
+    call patch_branch
+    j    .ps_done
+
+# ---- while ( expr ) stmt ----
+.ps_while:
+    li   a0, TK_WHILE
+    call consume
+
+    # record loop top
+    la   t0, g_emit_ptr
+    ld   s1, 0(t0)          # s1 = loop_top addr
+
+    li   a0, TK_LPAREN
+    call expect
+    call parse_expr
+    li   a0, TK_RPAREN
+    call expect
+
+    # emit beqz a0, ? (hole for loop exit)
+    call emit_beqz_a0_hole
+    mv   s2, a0             # s2 = beqz hole addr
+
+    call parse_stmt
+
+    # emit j loop_top (unconditional back-edge)
+    # We need to emit jal x0, offset where offset = loop_top - current_emit_ptr
+    call emit_j_hole
+    mv   s3, a0             # s3 = j hole addr
+    mv   a0, s3
+    mv   a1, s1             # target = loop_top
+    call patch_jump
+
+    # patch beqz to current emit position (loop exit)
+    mv   a0, s2
+    la   t0, g_emit_ptr
+    ld   a1, 0(t0)
+    call patch_branch
+    j    .ps_done
+
+# ---- { stmt* } ----
+.ps_block:
+    call parse_block
+    j    .ps_done
+
+# ---- int ident [= expr] ; ----
+.ps_vardecl:
+    li   a0, TK_INT
+    call consume
+
+    # capture ident name
+    call peek
+    la   t0, g_tok
+    ld   s1, 16(t0)         # name_ptr
+    ld   s2, 24(t0)         # name_len
+    li   a0, TK_IDENT
+    call expect
+
+    # bump g_frame_size, get offset
+    la   t0, g_frame_size
+    ld   t1, 0(t0)
+    addi t1, t1, 8
+    sd   t1, 0(t0)
+    neg  s3, t1             # s3 = offset = -frame_size
+
+    # sym_add(name_ptr, name_len, offset)
+    mv   a0, s1
+    mv   a1, s2
+    mv   a2, s3
+    call sym_add
+
+    # optional initializer: = expr
+    li   a0, TK_ASSIGN
+    call consume
+    beqz a0, .ps_vardecl_no_init
+
+    call parse_expr
+
+    # emit: sd a0, offset(s0)
+    mv   a0, s3
+    call emit_sd_a0_off_s0
+
+.ps_vardecl_no_init:
+    li   a0, TK_SEMI
+    call expect
+    j    .ps_done
+
+# ---- expression statement: expr ; ----
+.ps_exprstmt:
+    call parse_expr
+    li   a0, TK_SEMI
+    call expect
+
+.ps_done:
+    ld   s3,  0(sp)
+    ld   s2,  8(sp)
+    ld   s1, 16(sp)
+    ld   ra, 24(sp)
+    addi sp, sp, 32
+    ret
 
 #-------------------------------- parse_expr --------------------------------
 .globl parse_expr
@@ -1116,31 +1972,250 @@ parse_expr:
 # If lvalue and next token is '=': emit sd a0, offset(s0) after rhs.
 .globl parse_assign
 parse_assign:
-    ret                     # TODO
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+    sd   s1, 0(sp)
+
+    call parse_or            # a0 = result (value in generated a0)
+
+    # check if last primary was an lvalue and next token is '='
+    la   t0, g_last_was_lval
+    ld   t1, 0(t0)
+    beqz t1, .pa_done        # not an lvalue
+
+    # save the lval offset before consume might clobber things
+    la   t0, g_last_lval_offset
+    ld   s1, 0(t0)           # s1 = lval fp offset
+
+    li   a0, TK_ASSIGN
+    call consume
+    beqz a0, .pa_done        # no '=' follows
+
+    # parse RHS (right-associative: call parse_assign recursively)
+    call parse_assign
+
+    # emit: sd a0, offset(s0)  (store result into the variable)
+    mv   a0, s1
+    call emit_sd_a0_off_s0
+
+.pa_done:
+    # clear lval flag
+    la   t0, g_last_was_lval
+    sd   x0, 0(t0)
+
+    ld   s1, 0(sp)
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
 
 #-------------------------------- parse_or --------------------------------
 # logical_or → logical_and ('||' logical_and)*
 # Short-circuit: emit beqz / bnez holes, patch at end.
 .globl parse_or
 parse_or:
-    ret                     # TODO
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+
+    call parse_and
+
+.por_loop:
+    li   a0, TK_OR
+    call consume
+    beqz a0, .por_done
+
+    # push left operand
+    call emit_push_a0
+    call parse_and
+    call emit_pop_a1
+
+    # emit: snez a1, a1  (a1 = left != 0)
+    li   a0, 0x00B03533      # sltu a0(x10), x0, a1(x11) — but we want rd=a1
+    # Actually: snez a1,a1 = sltu a1,x0,a1 → funct7=0,rs2=x11,rs1=x0,funct3=011,rd=x11,op=0110011
+    # = 0000000 01011 00000 011 01011 0110011 = 0x00B035B3
+    li   a0, 0x00B035B3      # snez a1, a1
+    call emit_u32
+    # emit: snez a0, a0  = sltu a0,x0,a0
+    # = 0000000 01010 00000 011 01010 0110011 = 0x00A03533
+    li   a0, 0x00A03533      # snez a0, a0
+    call emit_u32
+    # emit: or a0, a0, a1
+    # = 0000000 01011 01010 110 01010 0110011 = 0x00B56533
+    li   a0, 0x00B56533      # or a0, a0, a1
+    call emit_u32
+
+    j    .por_loop
+.por_done:
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
 
 #-------------------------------- parse_and --------------------------------
 .globl parse_and
 parse_and:
-    ret                     # TODO
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+
+    call parse_equ
+
+.pand_loop:
+    li   a0, TK_AND
+    call consume
+    beqz a0, .pand_done
+
+    call emit_push_a0
+    call parse_equ
+    call emit_pop_a1
+
+    # emit: snez a1, a1
+    li   a0, 0x00B035B3
+    call emit_u32
+    # emit: snez a0, a0
+    li   a0, 0x00A03533
+    call emit_u32
+    # emit: and a0, a0, a1
+    # = 0000000 01011 01010 111 01010 0110011 = 0x00B57533
+    li   a0, 0x00B57533
+    call emit_u32
+
+    j    .pand_loop
+.pand_done:
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
 
 #-------------------------------- parse_equ --------------------------------
 # equality → relational (('=='|'!=') relational)*
 .globl parse_equ
 parse_equ:
-    ret                     # TODO
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+    sd   s1, 0(sp)
+
+    call parse_relate
+
+.peq_loop:
+    # check for == or !=
+    li   a0, TK_EQ
+    call consume
+    bnez a0, .peq_eq
+    li   a0, TK_NEQ
+    call consume
+    bnez a0, .peq_neq
+    j    .peq_done
+
+.peq_eq:
+    li   s1, 1              # 1 = eq
+    j    .peq_binop
+.peq_neq:
+    li   s1, 2              # 2 = neq
+
+.peq_binop:
+    call emit_push_a0
+    call parse_relate
+    call emit_pop_a1
+
+    # emit: sub a0, a1, a0  (a1=left, a0=right)
+    # = 0100000 01010 01011 000 01010 0110011 = 0x40A58533
+    li   a0, 0x40A58533
+    call emit_u32
+
+    li   t0, 1
+    beq  s1, t0, .peq_emit_seqz
+    # neq: snez a0, a0  = sltu a0, x0, a0
+    li   a0, 0x00A03533
+    call emit_u32
+    j    .peq_loop
+
+.peq_emit_seqz:
+    # eq: seqz a0, a0  = sltiu a0, a0, 1
+    li   a0, 0x00153513
+    call emit_u32
+    j    .peq_loop
+
+.peq_done:
+    ld   s1, 0(sp)
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
 
 #-------------------------------- parse_relate --------------------------------
 # relational → additive (('<'|'>'|'<='|'>=') additive)*
 .globl parse_relate
 parse_relate:
-    ret                     # TODO
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+    sd   s1, 0(sp)
+
+    call parse_addsub
+
+.prel_loop:
+    li   a0, TK_LT
+    call consume
+    bnez a0, .prel_lt
+    li   a0, TK_GT
+    call consume
+    bnez a0, .prel_gt
+    li   a0, TK_LE
+    call consume
+    bnez a0, .prel_le
+    li   a0, TK_GE
+    call consume
+    bnez a0, .prel_ge
+    j    .prel_done
+
+.prel_lt:  li s1, 1; j .prel_binop
+.prel_gt:  li s1, 2; j .prel_binop
+.prel_le:  li s1, 3; j .prel_binop
+.prel_ge:  li s1, 4; j .prel_binop
+
+.prel_binop:
+    call emit_push_a0
+    call parse_addsub
+    call emit_pop_a1         # a1 = left, a0 = right
+
+    li   t0, 1
+    beq  s1, t0, .prel_emit_lt
+    li   t0, 2
+    beq  s1, t0, .prel_emit_gt
+    li   t0, 3
+    beq  s1, t0, .prel_emit_le
+    j    .prel_emit_ge
+
+.prel_emit_lt:
+    # slt a0, a1, a0  (left < right)
+    # = 0000000 01010 01011 010 01010 0110011 = 0x00A5A533
+    li   a0, 0x00A5A533
+    call emit_u32
+    j    .prel_loop
+
+.prel_emit_gt:
+    # slt a0, a0, a1  (right < left = left > right)
+    # = 0000000 01011 01010 010 01010 0110011 = 0x00B52533
+    li   a0, 0x00B52533
+    call emit_u32
+    j    .prel_loop
+
+.prel_emit_le:
+    # slt a0, a0, a1 then xori a0,a0,1  (!(left > right) = left <= right)
+    li   a0, 0x00B52533      # slt a0, a0, a1
+    call emit_u32
+    li   a0, 0x00154513      # xori a0, a0, 1
+    call emit_u32
+    j    .prel_loop
+
+.prel_emit_ge:
+    # slt a0, a1, a0 then xori a0,a0,1  (!(left < right) = left >= right)
+    li   a0, 0x00A5A533      # slt a0, a1, a0
+    call emit_u32
+    li   a0, 0x00154513      # xori a0, a0, 1
+    call emit_u32
+    j    .prel_loop
+
+.prel_done:
+    ld   s1, 0(sp)
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
 
 #-------------------------------- parse_addsub --------------------------------
 # additive → multiplicative (('+' | '-') multiplicative)*
@@ -1153,18 +2228,144 @@ parse_relate:
 #     emit: add a0,a1,a0  or  sub a0,a1,a0
 .globl parse_addsub
 parse_addsub:
-    ret                     # TODO
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+    sd   s1, 0(sp)
+
+    call parse_muldiv
+
+.pas_loop:
+    li   a0, TK_PLUS
+    call consume
+    bnez a0, .pas_add
+    li   a0, TK_MINUS
+    call consume
+    bnez a0, .pas_sub
+    j    .pas_done
+
+.pas_add: li s1, 1; j .pas_binop
+.pas_sub: li s1, 2
+
+.pas_binop:
+    call emit_push_a0
+    call parse_muldiv
+    call emit_pop_a1         # a1=left, a0=right
+
+    li   t0, 1
+    beq  s1, t0, .pas_emit_add
+    # sub a0, a1, a0
+    li   a0, 0x40A58533
+    call emit_u32
+    j    .pas_loop
+
+.pas_emit_add:
+    # add a0, a1, a0
+    li   a0, 0x00A58533
+    call emit_u32
+    j    .pas_loop
+
+.pas_done:
+    ld   s1, 0(sp)
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
 
 #-------------------------------- parse_muldiv --------------------------------
 .globl parse_muldiv
 parse_muldiv:
-    ret                     # TODO
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+    sd   s1, 0(sp)
+
+    call parse_unary
+
+.pmd_loop:
+    li   a0, TK_MUL
+    call consume
+    bnez a0, .pmd_mul
+    li   a0, TK_DIV
+    call consume
+    bnez a0, .pmd_div
+    li   a0, TK_MOD
+    call consume
+    bnez a0, .pmd_mod
+    j    .pmd_done
+
+.pmd_mul: li s1, 1; j .pmd_binop
+.pmd_div: li s1, 2; j .pmd_binop
+.pmd_mod: li s1, 3
+
+.pmd_binop:
+    call emit_push_a0
+    call parse_unary
+    call emit_pop_a1         # a1=left, a0=right
+
+    li   t0, 1
+    beq  s1, t0, .pmd_emit_mul
+    li   t0, 2
+    beq  s1, t0, .pmd_emit_div
+    # rem a0, a1, a0
+    li   a0, 0x02A5E533
+    call emit_u32
+    j    .pmd_loop
+
+.pmd_emit_mul:
+    # mul a0, a1, a0
+    li   a0, 0x02A58533
+    call emit_u32
+    j    .pmd_loop
+
+.pmd_emit_div:
+    # div a0, a1, a0
+    li   a0, 0x02A5C533
+    call emit_u32
+    j    .pmd_loop
+
+.pmd_done:
+    ld   s1, 0(sp)
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
 
 #-------------------------------- parse_unary --------------------------------
 # unary → ('!' | '-') unary  |  parse_primary
 .globl parse_unary
 parse_unary:
-    ret                     # TODO
+    addi sp, sp, -16
+    sd   ra, 8(sp)
+
+    # check for unary minus
+    li   a0, TK_MINUS
+    call consume
+    bnez a0, .pu_neg
+
+    # check for unary not
+    li   a0, TK_NOT
+    call consume
+    bnez a0, .pu_not
+
+    # otherwise: primary
+    call parse_primary
+    j    .pu_done
+
+.pu_neg:
+    call parse_unary
+    # emit: sub a0, x0, a0  (neg a0, a0)
+    # = 0100000 01010 00000 000 01010 0110011 = 0x40A00533
+    li   a0, 0x40A00533
+    call emit_u32
+    j    .pu_done
+
+.pu_not:
+    call parse_unary
+    # emit: seqz a0, a0  = sltiu a0, a0, 1
+    li   a0, 0x00153513
+    call emit_u32
+
+.pu_done:
+    ld   ra, 8(sp)
+    addi sp, sp, 16
+    ret
 
 #-------------------------------- parse_primary --------------------------------
 # primary → NUM | ident ['(' args ')'] | '(' expr ')'
@@ -1176,7 +2377,211 @@ parse_unary:
 # On '(' expr ')': consume, call parse_expr, expect ')'
 .globl parse_primary
 parse_primary:
-    ret                     # TODO
+    addi sp, sp, -32
+    sd   ra, 24(sp)
+    sd   s1, 16(sp)
+    sd   s2,  8(sp)
+    sd   s3,  0(sp)
+
+    # clear lval flag
+    la   t0, g_last_was_lval
+    sd   x0, 0(t0)
+
+    call peek
+
+    li   t0, TK_NUM
+    beq  a0, t0, .pp_num
+    li   t0, TK_IDENT
+    beq  a0, t0, .pp_ident
+    li   t0, TK_LPAREN
+    beq  a0, t0, .pp_paren
+
+    # unexpected token
+    la   t0, g_tok
+    ld   a0, 16(t0)
+    la   a1, expected_token_msg
+    li   a2, expected_token_msg_len
+    call error_at
+
+# ---- number literal ----
+.pp_num:
+    # save tok.val before consuming
+    la   t0, g_tok
+    ld   s1, 8(t0)           # s1 = value
+    li   a0, TK_NUM
+    call consume
+
+    # emit li a0, value
+    mv   a0, s1
+    call emit_li_a0
+    j    .pp_done
+
+# ---- identifier (variable ref or function call) ----
+.pp_ident:
+    # capture name before consuming
+    la   t0, g_tok
+    ld   s1, 16(t0)          # s1 = name_ptr
+    ld   s2, 24(t0)          # s2 = name_len
+    li   a0, TK_IDENT
+    call consume
+
+    # check for function call: ident '('
+    call peek
+    li   t0, TK_LPAREN
+    beq  a0, t0, .pp_funcall
+
+    # variable reference: look up in sym table
+    mv   a0, s1
+    mv   a1, s2
+    call sym_lookup           # a0 = offset, a1 = found?
+
+    beqz a1, .pp_undeclared
+
+    mv   s3, a0              # s3 = fp offset
+
+    # emit: ld a0, offset(s0)
+    mv   a0, s3
+    call emit_ld_a0_off_s0
+
+    # set lval info for parse_assign
+    la   t0, g_last_was_lval
+    li   t1, 1
+    sd   t1, 0(t0)
+    la   t0, g_last_lval_offset
+    sd   s3, 0(t0)
+    j    .pp_done
+
+.pp_undeclared:
+    mv   a0, s1              # point at the identifier
+    la   a1, undeclared_var_msg
+    li   a2, undeclared_var_msg_len
+    call error_at
+
+# ---- function call: ident '(' args ')' ----
+.pp_funcall:
+    li   a0, TK_LPAREN
+    call consume
+
+    # For now, support up to 8 args pushed onto compiler stack,
+    # then moved into a0-a7 before the call.
+    # Strategy: emit each arg expr, push result. After all args,
+    # pop into a7..a0 (reverse order). Then emit call.
+    # We use s3 as arg count.
+    li   s3, 0               # arg count
+
+    # check for empty arg list
+    call peek
+    li   t0, TK_RPAREN
+    beq  a0, t0, .pp_fc_noargs
+
+.pp_fc_argloop:
+    call parse_expr
+    call emit_push_a0        # push arg value
+    addi s3, s3, 1
+
+    li   a0, TK_COMMA
+    call consume
+    bnez a0, .pp_fc_argloop
+
+.pp_fc_noargs:
+    li   a0, TK_RPAREN
+    call expect
+
+    # pop args into a0-a7 (pop in reverse: last pushed = highest arg reg)
+    # We pop s3 values. First pop goes into a(s3-1), last into a0.
+    mv   t0, s3
+.pp_fc_pop:
+    beqz t0, .pp_fc_call
+    addi t0, t0, -1
+
+    # emit: ld a(t0), 0(sp); addi sp,sp,8
+    # ld aX, 0(sp): I-type imm=0, rs1=sp(x2), funct3=011, rd=x(10+t0), op=0000011
+    # base for ld x10,0(sp) = 0x00013503
+    # each +1 to rd shifts by 7 bits: rd field is bits [11:7]
+    # So: 0x00013503 + (t0 << 7) ... but we can't do this at the compiler level
+    # since we're emitting machine code. We need to construct the encoding.
+
+    # rd = 10 + t0 (a0=x10, a1=x11, ..., a7=x17)
+    addi t1, t0, 10          # t1 = register number
+    slli t1, t1, 7           # shift to rd field [11:7]
+    li   t2, 0x00013003      # ld x0, 0(sp) base (rd=0, rs1=sp=x2, funct3=011, op=0000011)
+    or   a0, t1, t2
+    call emit_u32
+
+    # addi sp, sp, 8
+    li   a0, 0x00810113
+    call emit_u32
+
+    j    .pp_fc_pop
+
+.pp_fc_call:
+    # Now we need to emit a call to the function.
+    # For a simple compiler, we assume functions are at known offsets
+    # in the output buffer. For now, since we don't have a function
+    # address table yet, we'll emit a placeholder approach:
+    # We need a function relocation table. For simplicity in Stage 0,
+    # we'll use a simple forward-reference scheme:
+    # Store function addresses in a table (name -> output offset).
+    # For now, emit auipc t1, 0 + jalr ra, t1, 0 as placeholders
+    # that will need a fixup pass.
+    #
+    # SIMPLIFIED APPROACH for M4: emit an indirect call sequence.
+    # Since all functions are in the same output buffer, we can compute
+    # the offset at link time. For now, store the call site for fixup.
+    #
+    # Actually, the simplest approach: maintain a function address table.
+    # At parse_funcdef, record (name, output_offset).
+    # At call sites, look up the target and compute the relative offset.
+    # But targets may not be defined yet (forward references).
+    #
+    # For now, emit a call hole (auipc+jalr with imm=0) and record it
+    # for a fixup pass. This is complex. Since M0 only needs main()
+    # which returns a constant and is called from _start, and M4 adds
+    # function calls, let's just emit a placeholder and mark it TODO.
+    # We'll emit: jal ra, 0 (placeholder) and record for fixup.
+
+    # For simplicity, use the func reloc table approach:
+    # Record (call_site_addr, func_name_ptr, func_name_len) in g_reloc_table
+    # and do a fixup pass after parse_program.
+
+    # emit jal ra, 0 (J-type: rd=ra=x1, imm=0)
+    # opcode=1101111, rd=00001 → 0x000000EF
+    la   t0, g_emit_ptr
+    ld   s3, 0(t0)          # s3 = call site addr (callee-saved, already on stack)
+
+    li   a0, 0x000000EF      # jal ra, 0
+    call emit_u32
+
+    # record relocation: (call_site, name_ptr, name_len)
+    la   t0, g_reloc_count
+    ld   t2, 0(t0)
+    li   t3, 24
+    mul  t3, t2, t3
+    la   t4, g_reloc_table
+    add  t4, t4, t3
+    sd   s3, 0(t4)          # call_site_addr
+    sd   s1, 8(t4)          # func_name_ptr
+    sd   s2, 16(t4)         # func_name_len
+    addi t2, t2, 1
+    sd   t2, 0(t0)
+
+    j    .pp_done
+
+# ---- parenthesized expression ----
+.pp_paren:
+    li   a0, TK_LPAREN
+    call consume
+    call parse_expr
+    li   a0, TK_RPAREN
+    call expect
+
+.pp_done:
+    ld   s3,  0(sp)
+    ld   s2,  8(sp)
+    ld   s1, 16(sp)
+    ld   ra, 24(sp)
+    addi sp, sp, 32
+    ret
 
 
 #====================== globals ======================
@@ -1203,9 +2608,14 @@ g_last_lval_offset: .quad 0     # fp-relative offset of that lvalue
 # symbol table: 64 entries × 24 bytes (name_ptr, name_len, fp_offset)
 g_sym_table:        .zero (64 * 24)
 
+# function address table: 64 entries × 24 bytes (name_ptr, name_len, output_addr)
+g_func_count:       .quad 0
+g_func_table:       .zero (64 * 24)
+
+# call relocation table: 128 entries × 24 bytes (call_site_addr, name_ptr, name_len)
+g_reloc_count:      .quad 0
+g_reloc_table:      .zero (128 * 24)
+
 # output code buffer: 512 KiB (enough for a Stage 1 compiler)
     .balign 4096
 g_out_buf:          .zero (512 * 1024)
-
-.section .data
-    # TODO: any mutable tables/buffers you want initialized at load time
