@@ -10,7 +10,7 @@ TEST_DIR = test
 
 COMPILER = $(BUILD_DIR)/fstcc0
 
-.PHONY: all clean test run
+.PHONY: all clean test run test-suite
 
 # Build the compiler
 all: $(COMPILER)
@@ -31,11 +31,10 @@ FILE ?= $(TEST_DIR)/test.c
 test: $(COMPILER)
 	@echo "=== Compiling $(FILE) ==="
 	$(QEMU) $(COMPILER) $(FILE) $(BUILD_DIR)/out.s
-	@echo "=== Generated assembly ==="
-	@cat $(BUILD_DIR)/out.s
-	@echo "=== Assembling and linking ==="
 	$(AS) -o $(BUILD_DIR)/out.o $(BUILD_DIR)/out.s
 	$(LD) -o $(BUILD_DIR)/out $(BUILD_DIR)/out.o
+	@echo "=== Generated assembly ==="
+	@cat $(BUILD_DIR)/out.s
 	@echo "=== Running ==="
 	@$(QEMU) $(BUILD_DIR)/out; echo "Exit code: $$?"
 
@@ -43,10 +42,14 @@ test: $(COMPILER)
 N ?= 42
 run: $(COMPILER)
 	@echo 'int main() { return $(N); }' > $(BUILD_DIR)/tmp.c
-	@$(QEMU) $(COMPILER) $(BUILD_DIR)/tmp.c $(BUILD_DIR)/out.s
-	@$(AS) -o $(BUILD_DIR)/out.o $(BUILD_DIR)/out.s
-	@$(LD) -o $(BUILD_DIR)/out $(BUILD_DIR)/out.o
+	@$(QEMU) $(COMPILER) $(BUILD_DIR)/tmp.c $(BUILD_DIR)/tmp.s
+	@$(AS) -o $(BUILD_DIR)/tmp.o $(BUILD_DIR)/tmp.s
+	@$(LD) -o $(BUILD_DIR)/out $(BUILD_DIR)/tmp.o
+	@cat $(BUILD_DIR)/tmp.s
 	@$(QEMU) $(BUILD_DIR)/out; echo "$$?"
+
+test-suite: $(COMPILER)
+	bash $(TEST_DIR)/run_tests.sh
 
 clean:
 	rm -rf $(BUILD_DIR)
