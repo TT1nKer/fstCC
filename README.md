@@ -64,7 +64,7 @@ int main() { return fact(5); }  // exit code: 120
 
 ---
 
-## Test Results
+## Test ResultsTT1nKer
 
 ```
 M0 — Return constant         3/3   ✓
@@ -154,10 +154,10 @@ open input.c via mmap
     │                                     │
     │  program → funcdef*                 │
     │  funcdef → int name(params) block   │
-    │  block   → { stmt* }               │
+    │  block   → { stmt* }                │
     │  stmt    → return | if | while |    │
     │            vardecl | expr;          │
-    │  expr    → or → and → eq → rel →   │
+    │  expr    → or → and → eq → rel →    │
     │            add → mul → unary →      │
     │            primary                  │
     └────┬────────────────────────────────┘
