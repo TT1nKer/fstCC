@@ -12,12 +12,12 @@ Most compilers are written in a high-level language and rely on existing compile
 
 ```
 Stage 0: fstcc0                Stage 1: fstcc1 (next)         Stage 2
-┌──────────────────────┐       ┌──────────────────────┐       ┌─────────────────┐
-│  src/fstcc0.s        │  →    │  fstcc1.c             │  →   │  fstcc1 compiles│
-│  ~2500 lines         │       │  written in L0 C      │       │  itself         │
-│  hand-written RV64   │       │  compiled by fstcc0   │       │  self-hosting ✓ │
-│  emits .s text       │       │  understands L1 C     │       │                 │
-└──────────────────────┘       └──────────────────────┘       └─────────────────┘
+┌──────────────────────┐       ┌──────────────────────┐       ┌──────────────────┐
+│  src/fstcc0.s        │  →    │  fstcc1.c            │  →    │  fstcc1 compiles │
+│  ~2500 lines         │       │  written in L0 C     │       │  itself          │
+│  hand-written RV64   │       │  compiled by fstcc0  │       │  self-hosting ✓  │
+│  emits .s text       │       │  understands L1 C    │       │                  │
+└──────────────────────┘       └──────────────────────┘       └──────────────────┘
 ```
 
 **The pipeline:**
