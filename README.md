@@ -1,8 +1,24 @@
-# fstCC — A Self-Hosting C Compiler, Built From Scratch
+<p align="center">
+  <img src="docs/readme-cover.svg" alt="fstCC — bootstrap compiler" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://ttinker.net">ttinker.net</a> ·
+  <a href="ROADMAP.md">roadmap</a> ·
+  <a href="bootstrap/test/proof/stage0_proof.md">stage-0 proof</a>
+</p>
+
+# fstCC — A Bootstrap C Compiler, Built From Scratch
 
 A C compiler bootstrapped from a single hand-written RISC-V assembly file — no libc, no LLVM, no external frameworks. The compiler understands real C code and produces working RISC-V binaries.
 
-**Stage 0 is complete: 39/39 tests pass**, including recursion, arithmetic, and multi-function programs.
+**Stage 0 is complete: the repository records 39/39 passing tests**, including
+recursion, arithmetic, and multi-function programs. The compiler is **not
+self-hosting yet**; self-hosting is the destination of stages 1 and 2.
+
+| State | Evidence | Current boundary |
+| --- | --- | --- |
+| Stage 0 complete | 39-case proof and generated RV64 assembly in `bootstrap/test/proof/` | Implements the L0 subset; requires the RISC-V GNU toolchain and QEMU; stages 1–2 do not exist yet |
 
 ---
 
@@ -64,7 +80,7 @@ int main() { return fact(5); }  // exit code: 120
 
 ---
 
-## Test ResultsTT1nKer
+## Test Results
 
 ```
 M0 — Return constant         3/3   ✓
